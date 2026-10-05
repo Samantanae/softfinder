@@ -11,17 +11,25 @@ def print_report(entries):
     """Print the entries grouped by drive, with a total per drive."""
     for drv in sorted({e["drive"] for e in entries}):
         grp = [e for e in entries if e["drive"] == drv]
+        # Separator between drives
         label = "Files not found (size = registry value)" if drv == "?" else f"Drive {drv}"
+        # Print the header for this drive
         print(f"\n===== {label} — {len(grp)} software — total {human(sum(e['size'] for e in grp))} =====")
         for e in grp:
+            # Print each software entry within the drive
             tag = "~" if e["approx_size"] else " "
+            # Mark entries with approximate size from the registry
             win = "[WIN] " if e["windows"] == "Yes" else ""
+            # Determine the display location for this software entry
             place = e["location"] or (f"(declared: {e['declared_location']})" if e.get("declared_location") else "-")
+            # Print the software entry with its size, name, source, and location
             print(f"{tag}{human(e['size']):>10}  {win}{e['name'][:45]:<45} [{e['source']}]  {place}")
+            # Print the status and description if available
             if e["status"] != "OK":
                 print(f"{'':>13}! {e['status']}")
             if e["description"]:
                 print(f"{'':>13}-> {e['description']}")
+    # Print the summary of Windows-required components
     nb_win = sum(e["windows"] == "Yes" for e in entries)
     print(f"\n{nb_win} component(s) required for Windows to work out of {len(entries)} (marked [WIN]).")
 

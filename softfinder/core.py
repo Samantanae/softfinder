@@ -63,7 +63,7 @@ ROOT_EXCLUDES = {
 # Program Files/ProgramData folders never reported as "leftovers" (system/shared data).
 LEFTOVER_EXCLUDES = {"microsoft", "microsoft shared", "common files", "package cache", "windowsapps",
                      "uninstall information", "modifiablewindowsapps", "windows", "ssh", "temp"}
-# AppData subfolders that only hold caches/data, not software.
+# AppData / profile-root subfolders that only hold caches.
 APPDATA_EXCLUDES = {"microsoft", "temp", "packages", "cache", "crashdumps",
                     "d3dscache", "history", "comms", "connecteddevicesplatform"}
 # Windows folder(s): executables there (e.g. system services) are not third-party software.
@@ -611,8 +611,18 @@ def candidate_roots(deep):
     users = Path(env.get("SystemDrive", "C:") + "\\Users")
     for u in (users.iterdir() if users.exists() else []):
         for sub, flt, res in ((r"AppData\Local\Programs", False, True), (r"AppData\Local", True, False),
-                              (r"AppData\Roaming", True, False)):
-            roots.append((str(u / sub), flt, res))
+                              (r"AppData\Roaming", True, False), (r"AppData\LocalLow", True, False),
+                              ("", True, False)):  # "" = profile root (.vscode, .cargo, .nvm, ...)
+            roots.append((str(u / sub) if sub else str(u), flt, res))
+        # Places where portable software is often dropped or installed per user
+        for sub in ("Desktop", "Downloads", "Documents", "Games", "scoop\\apps", "OneDrive\\Desktop",
+                    "OneDrive\\Documents"):
+            roots.append((str(u / sub), False, False))
+    roots.append((os.path.join(env.get("PUBLIC", env.get("SystemDrive", "C:") + "\\Users\\Public"), "Desktop"),
+                  False, False))
+    # Package managers installing outside Program Files
+    roots.append((os.path.join(env.get("ProgramData", r"C:\ProgramData"), "chocolatey", "lib"), False, False))
+    roots.append((os.path.join(env.get("ProgramData", r"C:\ProgramData"), "scoop", "apps"), False, False))
     for d in drives():
         try:
             for e in os.scandir(d):
@@ -684,13 +694,20 @@ def find_unregistered(known, deep):
                 continue
             examine(s, leftovers, 0, drive_root)
     bar.close()
+
+    # Folders listed in PATH that hold executables (command-line tools installed by hand)
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        n = norm(p.strip().strip('"'))
+        if (n and os.path.isdir(n) and not n.startswith(SYSTEM_FOLDERS) and not inside_known(n)
+                and not any(n == norm(f) or n.startswith(norm(f) + "\\") for f in found) and has_exe(n, 0)):
+            found[n] = "exe"
     return dict(sorted(found.items(), key=lambda kv: kv[0].lower()))
 
 
 # ------------------------------------------------------------------- public API
 # Columns (in order) of the CSV/JSON exports
-COLUMNS = ["drive", "name", "description", "windows", "status", "publisher", "version", "size", "files",
-           "approx_size", "source", "location", "declared_location"]
+COLUMNS = ["drive", "name", "description", "windows", "status", "publisher", "version", "size", "size_human",
+           "files", "approx_size", "source", "location", "declared_location"]
 
 
 def is_admin():
@@ -708,7 +725,7 @@ def scan(deep=False, workers=8, progress=True, log=None):
     workers:  threads used to compute sizes.
     progress: show the progress bars on stderr.
     log:      optional callable receiving status messages (e.g. `print`).
-    Each dict has the keys listed in COLUMNS ("size" is in bytes).
+    Each dict has the keys listed in COLUMNS ("size" is in bytes, "size_human" is the same value through human()).
     """
     if os.name != "nt" or winreg is None:
         raise OSError("SoftFinder only works on Windows.")
@@ -800,6 +817,7 @@ def _scan(deep, workers, log):
             e["description"] = short(exe_description(e["location"]))
         e["description"] = e.get("description", "")
         e["windows"] = "Yes" if is_windows(e) else "No"
+        e["size_human"] = human(e["size"])
         bar.step(f"{e['name'][:30]} ({human(e['size'])})")
         return e
 

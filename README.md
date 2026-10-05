@@ -76,8 +76,9 @@ for e in softfinder.scan(deep=False, workers=8, progress=False):
 
 ### CSV / JSON columns
 
-`drive, name, description, windows, status, publisher, version, size, files,
-approx_size, source, location, declared_location` (`size` in bytes).
+`drive, name, description, windows, status, publisher, version, size, size_human,
+files, approx_size, source, location, declared_location` (`size` in bytes,
+`size_human` is the same value formatted by `human()`, e.g. `2.00 GB`).
 
 ## Limitations
 
