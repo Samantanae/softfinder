@@ -3,3 +3,4 @@
 *.txt
 *.xlsx
 software_inventory.json
+*.pyc
