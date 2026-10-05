@@ -345,11 +345,12 @@ def from_registry():
     otherwise is deduced from DisplayIcon / UninstallString (often filled in).
     """
     items = []
+    roots_patch = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
     roots = [
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_64KEY),
-        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_32KEY),
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_64KEY),
-        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_32KEY),
+        (winreg.HKEY_LOCAL_MACHINE, roots_patch, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, roots_patch, winreg.KEY_WOW64_32KEY),
+        (winreg.HKEY_CURRENT_USER, roots_patch, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_CURRENT_USER, roots_patch, winreg.KEY_WOW64_32KEY),
     ]
     # other loaded profiles (mostly require admin)
     try:
@@ -358,24 +359,24 @@ def from_registry():
             sid = winreg.EnumKey(winreg.HKEY_USERS, i)
             i += 1
             if sid.startswith("S-1-5-21") and not sid.endswith("_Classes"):
-                roots.append((winreg.HKEY_USERS, sid + r"\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", 0))
-    except OSError:
+                roots.append((winreg.HKEY_USERS, sid + "\\"+ roots_patch, 0))
+    except OSError: # likely no more user profiles to enumerate
         pass
     for hive, path, flag in roots:
         try:
             base = winreg.OpenKey(hive, path, 0, winreg.KEY_READ | flag)
-        except OSError:
+        except OSError:  # likely cannot open this registry key
             continue
         j = 0
         while True:
             try:
                 sub = winreg.EnumKey(base, j)
                 j += 1
-            except OSError:
+            except OSError:  # likely no more subkeys in this uninstall key
                 break
             try:
                 v = reg_values(winreg.OpenKey(base, sub))
-            except OSError:
+            except OSError:  # likely cannot open this subkey
                 continue
             name = v.get("DisplayName")
             if not name or v.get("SystemComponent") == 1 and not v.get("InstallLocation"):
@@ -409,7 +410,7 @@ def msi_install_location(guid):
         size = ctypes.c_uint(1024)
         if ctypes.windll.msi.MsiGetProductInfoW(guid, "InstallLocation", buf, ctypes.byref(size)) == 0:
             return buf.value
-    except Exception:
+    except Exception:  # likely failed to query MSI for this product
         pass
     return ""
 
