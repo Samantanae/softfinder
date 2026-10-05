@@ -1,4 +1,5 @@
-﻿"""
+﻿# VERSION IN FRENCH. FOR THE ENGLISH VERSION, SEE scan_logiciels.py
+"""
 Inventaire complet des logiciels installés (Windows) avec taille réelle et emplacement.
 
 Sources combinées :

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "softfinder"
+version = "1.0.0"
+description = "Complete inventory of installed software on Windows, with real size and location"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+softfinder = "softfinder.cli:main"
+
+[tool.setuptools]
+packages = ["softfinder"]

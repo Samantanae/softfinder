@@ -1,6 +1,6 @@
-# Software inventory (Windows)
+# SoftFinder
 
-`scan_logiciels.py` lists **all** the software installed on every drive, with its
+The `softfinder` package lists **all** the software installed on every drive, with its
 **real size on disk** and its **location**, including software that a normal
 scan misses (no uninstaller, portable, games, leftovers of removed software).
 
@@ -14,10 +14,11 @@ scan misses (no uninstaller, portable, games, leftovers of removed software).
 ## Usage
 
 ```powershell
-python -X utf8 scan_logiciels.py
-python -X utf8 scan_logiciels.py --csv inventory.csv --json inventory.json
-python -X utf8 scan_logiciels.py --deep        # one extra level in container folders (e.g. D:\Games\...)
-python -X utf8 scan_logiciels.py --workers 16  # more threads for size computation
+py softfinder.py                         # short version
+python -X utf8 -m softfinder
+python -X utf8 -m softfinder --csv inventory.csv --json inventory.json
+python -X utf8 -m softfinder --deep        # one extra level in container folders (e.g. D:\Games\...)
+python -X utf8 -m softfinder --workers 16  # more threads for size computation
 ```
 
 | Option      | Default                   | Description                                   |
@@ -29,6 +30,17 @@ python -X utf8 scan_logiciels.py --workers 16  # more threads for size computati
 
 A full scan can take several minutes. Progress bars (stderr) show the
 progress of the three phases: sources, drive scan, size computation.
+
+## Use as a Python module
+
+```python
+import softfinder
+
+for e in softfinder.scan(deep=False, workers=8, progress=False):
+    print(e['name'], softfinder.human(e['size']), e['location'])
+```
+
+`scan()` returns a list of dicts (keys = CSV columns, `size` in bytes). Install with `pip install .` to get the `softfinder` command.
 
 ## How it works
 
