@@ -1,37 +1,37 @@
 """
-Inventaire complet des logiciels installés (Windows) avec taille réelle et emplacement.
+Complete inventory of installed software (Windows) with real size and location.
 
-Sources combinées :
-  1. Registre (Uninstall HKLM 64/32 bits, HKCU, profils utilisateurs chargés)
-  2. Applications Microsoft Store / MSIX (Get-AppxPackage)
-  3. Services Windows (exécutables hors dossiers système)
-  4. Clés "App Paths" du registre
-  5. Raccourcis du menu Démarrer
-  6. Analyse disque : dossiers contenant des .exe qui ne sont PAS enregistrés
-     (logiciels portables, jeux, Steam/Epic, outils copiés à la main, etc.)
+Combined sources:
+  1. Registry (Uninstall keys: HKLM 64/32-bit, HKCU, loaded user profiles)
+  2. Microsoft Store / MSIX applications (Get-AppxPackage)
+  3. Windows services (executables outside system folders)
+  4. Registry "App Paths" keys
+  5. Start menu shortcuts
+  6. Disk scan: folders containing .exe files that are NOT registered
+     (portable software, games, Steam/Epic, tools copied by hand, etc.)
 
-La taille est calculée en parcourant réellement les fichiers (et non la valeur
-"EstimatedSize" du registre, souvent fausse ou absente).
+The size is computed by actually walking the files (not the registry
+"EstimatedSize" value, which is often wrong or missing).
 
-Fonctionnement général (voir main()) :
-  1. Collecte des logiciels "connus" depuis les 5 premières sources.
-  2. Fusion des doublons : deux entrées ayant le même dossier = un seul logiciel.
-  3. Détection des logiciels "invisibles" : dossiers contenant des .exe qui ne
-     sont rattachés à aucune entrée connue.
-  4. Calcul de la taille réelle de chaque dossier (en parallèle).
-  5. Affichage groupé par lecteur + export CSV (séparateur ';') et JSON.
+General flow (see main()):
+  1. Collect "known" software from the first sources.
+  2. Merge duplicates: two entries with the same folder = a single software.
+  3. Detect "invisible" software: folders containing .exe files that are not
+     attached to any known entry, plus leftovers without executables.
+  4. Compute the real size of each folder (in parallel).
+  5. Print results grouped by drive + export to CSV (';' separator) and JSON.
 
-Prérequis : Windows, Python 3.8+, aucune dépendance externe. PowerShell est
-utilisé pour les applications Store et les raccourcis.
+Requirements: Windows, Python 3.8+, no external dependency. PowerShell is
+used for Store applications and shortcuts.
 
-Limites : sans droits administrateur, certains dossiers/profils sont illisibles.
-Un logiciel sans emplacement connu garde la taille du registre (marquée "~").
+Limits: without administrator rights, some folders/profiles are unreadable.
+Software with an unknown location keeps the registry size (marked "~").
 
-Usage (idéalement en administrateur) :
+Usage (preferably as administrator):
     python scan_logiciels.py
-    python scan_logiciels.py --csv inventaire.csv --json inventaire.json
-    python scan_logiciels.py --deep          # descend un niveau de plus dans les dossiers conteneurs (ex: D:\Jeux\...)
-    python scan_logiciels.py --workers 16    # plus de threads pour le calcul des tailles
+    python scan_logiciels.py --csv inventory.csv --json inventory.json
+    python scan_logiciels.py --deep          # go one level deeper in container folders (e.g. D:\\Games\\...)
+    python scan_logiciels.py --workers 16    # more threads for size computation
 """
 import argparse
 import csv
@@ -48,76 +48,77 @@ import winreg
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Attribut Windows des liens symboliques/jonctions : on ne les suit pas pour
-# éviter de compter deux fois les mêmes fichiers ou de boucler.
+# Windows attribute of symlinks/junctions: they are not followed, to avoid
+# counting the same files twice or looping forever.
 REPARSE = 0x400
-# Dossiers à la racine d'un lecteur qui ne contiennent jamais de logiciels utilisateur.
-EXCLUS_RACINE = {
+# Folders at a drive root that never contain user software.
+ROOT_EXCLUDES = {
     "windows", "$recycle.bin", "system volume information", "recovery",
     "$windows.~bt", "$windows.~ws", "config.msi", "documents and settings",
     "perflogs", "msocache", "$winreagent", "windows.old", "users", "found.000",
 }
-# Dossiers de Program Files/ProgramData jamais signalés comme "résidus" (données système/partagées).
-EXCLUS_RESIDU = {"microsoft", "microsoft shared", "common files", "package cache", "windowsapps",
-                 "uninstall information", "modifiablewindowsapps", "windows", "ssh", "temp"}
-# Sous-dossiers d'AppData qui ne contiennent que des caches/données, pas des logiciels.
-EXCLUS_APPDATA = {"microsoft", "temp", "packages", "cache", "crashdumps",
-                  "d3dscache", "history", "comms", "connecteddevicesplatform"}
-DOSSIERS_SYSTEME = tuple(
+# Program Files/ProgramData folders never reported as "leftovers" (system/shared data).
+LEFTOVER_EXCLUDES = {"microsoft", "microsoft shared", "common files", "package cache", "windowsapps",
+                     "uninstall information", "modifiablewindowsapps", "windows", "ssh", "temp"}
+# AppData subfolders that only hold caches/data, not software.
+APPDATA_EXCLUDES = {"microsoft", "temp", "packages", "cache", "crashdumps",
+                    "d3dscache", "history", "comms", "connecteddevicesplatform"}
+# Windows folder(s): executables there (e.g. system services) are not third-party software.
+SYSTEM_FOLDERS = tuple(
     p.lower() for p in (os.environ.get("WINDIR", r"C:\Windows"),)
 )
 
 
-# ----------------------------------------------------------------- utilitaires
+# ------------------------------------------------------------------- utilities
 class Progress:
-    """Barre de progression console (sans dépendance), thread-safe."""
+    """Console progress bar (no dependency), thread-safe."""
 
-    def __init__(self, titre, total):
-        """titre : libellé affiché ; total : nombre d'étapes attendues."""
-        self.titre, self.total, self.n, self.info = titre, max(total, 1), 0, ""
+    def __init__(self, title, total):
+        """title: displayed label; total: expected number of steps."""
+        self.title, self.total, self.n, self.info = title, max(total, 1), 0, ""
         self.lock = threading.Lock()
         self.draw()
 
     def draw(self):
-        """Redessine la ligne (\\r = retour en début de ligne, sans saut)."""
+        """Redraw the line (\\r = back to line start, no line break)."""
         w = 30
         fill = int(w * self.n / self.total)
         cols = shutil.get_terminal_size((100, 20)).columns
-        txt = f"\r{self.titre:<22} [{'#' * fill}{'.' * (w - fill)}] {self.n}/{self.total} " \
+        txt = f"\r{self.title:<22} [{'#' * fill}{'.' * (w - fill)}] {self.n}/{self.total} " \
               f"{100 * self.n // self.total:3d}%  {self.info}"
         sys.stderr.write(txt[: cols - 1].ljust(cols - 1))
         sys.stderr.flush()
 
     def step(self, info="", inc=1):
-        """Avance de `inc` étapes (0 = juste changer le texte) ; verrou car appelée par plusieurs threads."""
+        """Advance by `inc` steps (0 = only change the text); locked because called from several threads."""
         with self.lock:
             self.n += inc
             self.info = info
             self.draw()
 
     def close(self):
-        """Force 100 % et passe à la ligne."""
+        """Force 100% and move to the next line."""
         with self.lock:
-            self.n, self.info = self.total, "terminé"
+            self.n, self.info = self.total, "done"
             self.draw()
             sys.stderr.write("\n")
 
 
 def norm(p):
-    """Normalise un chemin (minuscules, sans '\\' final) pour comparer des chemins Windows."""
+    """Normalize a path (lowercase, no trailing '\\') to compare Windows paths."""
     return os.path.normpath(p).rstrip("\\/").lower() if p else ""
 
 
 def clean_path(raw):
-    """Extrait un chemin de fichier/dossier depuis une valeur de registre."""
-    # Ex: '"C:\\App\\x.exe" /uninstall' -> 'C:\\App\\x.exe' ; 'C:\\App\\x.exe,0' -> 'C:\\App\\x.exe'
+    """Extract a file/folder path from a registry value."""
+    # E.g. '"C:\\App\\x.exe" /uninstall' -> 'C:\\App\\x.exe' ; 'C:\\App\\x.exe,0' -> 'C:\\App\\x.exe'
     if not raw:
         return ""
     raw = os.path.expandvars(raw.strip())
     if raw.startswith('"'):
         raw = raw[1:].split('"')[0]
     else:
-        # Sans guillemets : on coupe après la première extension connue pour retirer les arguments.
+        # Without quotes: cut after the first known extension to drop the arguments.
         low = raw.lower()
         for ext in (".exe", ".ico", ".dll"):
             i = low.find(ext)
@@ -129,17 +130,17 @@ def clean_path(raw):
 
 
 def folder_of(path):
-    """Retourne le dossier d'un chemin (le chemin lui-même s'il est déjà un dossier)."""
+    """Return the folder of a path (the path itself if it is already a folder)."""
     if not path:
         return ""
     return path if os.path.isdir(path) else os.path.dirname(path)
 
 
 def dir_size(root):
-    """Taille réelle (octets) et nombre de fichiers ; ignore liens/jonctions, dédoublonne hardlinks."""
+    """Real size (bytes) and file count; ignores links/junctions, de-duplicates hard links."""
     total = count = 0
-    seen = set()  # (périphérique, inode) des fichiers à liens physiques déjà comptés
-    stack = [root]  # parcours itératif (pas de récursion : évite les limites de profondeur)
+    seen = set()  # (device, inode) of hard-linked files already counted
+    stack = [root]  # iterative walk (no recursion: avoids depth limits)
     while stack:
         d = stack.pop()
         try:
@@ -167,7 +168,7 @@ def dir_size(root):
 
 
 def has_exe(root, max_depth=3):
-    """True si `root` contient un .exe jusqu'à `max_depth` niveaux (critère de "c'est un logiciel")."""
+    """True if `root` contains an .exe up to `max_depth` levels (criterion for "this is software")."""
     stack = [(root, 0)]
     while stack:
         d, lvl = stack.pop()
@@ -187,16 +188,16 @@ def has_exe(root, max_depth=3):
 
 
 def exe_description(folder):
-    """Description (champ "FileDescription") lue dans les métadonnées d'un .exe du dossier.
+    """Description ("FileDescription" field) read from the metadata of an .exe in the folder.
 
-    On teste d'abord les .exe à la racine du dossier ; le premier qui a une
-    description exploitable est retenu. Retourne "" si rien n'est trouvé.
+    The .exe files at the root of the folder are tried first; the first one with
+    a usable description is kept. Returns "" if nothing is found.
     """
     try:
         exes = [e.path for e in os.scandir(folder) if e.is_file() and e.name.lower().endswith(".exe")]
     except OSError:
         return ""
-    # On évite les désinstallateurs/mises à jour, peu représentatifs du logiciel.
+    # Uninstallers/updaters are avoided: they are not representative of the software.
     exes.sort(key=lambda p: (any(w in os.path.basename(p).lower() for w in ("unins", "update", "setup", "crash")),
                              os.path.basename(p).lower()))
     for path in exes[:5]:
@@ -207,7 +208,7 @@ def exe_description(folder):
 
 
 def file_description(path):
-    """Lit FileDescription (ou ProductName) d'un exécutable via l'API Windows version.dll."""
+    """Read FileDescription (or ProductName) of an executable through the Windows version.dll API."""
     try:
         ver = ctypes.windll.version
         size = ver.GetFileVersionInfoSizeW(path, None)
@@ -217,12 +218,12 @@ def file_description(path):
         if not ver.GetFileVersionInfoW(path, 0, size, buf):
             return ""
         ptr, ln = ctypes.c_void_p(), ctypes.c_uint()
-        # Table langue/code page, nécessaire pour construire le chemin de la valeur
+        # Language/code page table, needed to build the path of the value
         if not ver.VerQueryValueW(buf, "\\VarFileInfo\\Translation", ctypes.byref(ptr), ctypes.byref(ln)) or not ln.value:
             return ""
         lang, cp = struct.unpack("<HH", ctypes.string_at(ptr, 4))
-        for champ in ("FileDescription", "ProductName"):
-            sub = f"\\StringFileInfo\\{lang:04x}{cp:04x}\\{champ}"
+        for field in ("FileDescription", "ProductName"):
+            sub = f"\\StringFileInfo\\{lang:04x}{cp:04x}\\{field}"
             if ver.VerQueryValueW(buf, sub, ctypes.byref(ptr), ctypes.byref(ln)) and ln.value:
                 txt = ctypes.wstring_at(ptr.value, ln.value).strip("\x00 ").strip()
                 if txt:
@@ -233,37 +234,37 @@ def file_description(path):
 
 
 def short(txt, n=120):
-    """Nettoie un texte (une seule ligne) et le tronque pour qu'il reste court."""
+    """Clean a text (single line) and truncate it to keep it short."""
     txt = " ".join(str(txt or "").split())
-    if txt.startswith("@"):  # référence de ressource non résolue (ex: @%SystemRoot%\\...)
+    if txt.startswith("@"):  # unresolved resource reference (e.g. @%SystemRoot%\\...)
         return ""
     return txt if len(txt) <= n else txt[: n - 1] + "…"
 
 
-# Dossiers (hors C:\Windows) qui font partie du fonctionnement même de Windows
-WINDOWS_DOSSIERS = ("windows defender", "windows nt", "windows security", "windowspowershell",
-                    "windows portable devices", "microsoft update health tools", "windows defender advanced threat protection")
+# Folders (outside C:\Windows) that are part of Windows itself
+WINDOWS_FOLDERS = ("windows defender", "windows nt", "windows security", "windowspowershell",
+                   "windows portable devices", "microsoft update health tools", "windows defender advanced threat protection")
 
 
 def is_windows(e):
-    """True si le composant est NÉCESSAIRE au fonctionnement de Windows (pas une simple appli Microsoft).
+    """True if the component is REQUIRED for Windows to work (not just a Microsoft app).
 
-    Critères (les applis facultatives comme Xbox, Photos, Paint, Edge sont exclues) :
-      - dossier système (C:\\Windows, ...) ou composant du système (Defender, PowerShell, ...) ;
-      - éditeur "Microsoft Windows" dans le registre ;
-      - paquet Store signé "System" ou non désinstallable (NonRemovable) selon Windows.
+    Criteria (optional apps such as Xbox, Photos, Paint, Edge are excluded):
+      - system folder (C:\\Windows, ...) or system component (Defender, PowerShell, ...);
+      - publisher "Microsoft Windows" in the registry;
+      - Store package flagged NonRemovable by Windows (Shell, Start menu, Search, ...).
     """
-    ed = (e.get("editeur") or "").lower()
-    loc = norm(e.get("emplacement", ""))
-    if e.get("systeme_appx") or "microsoft windows" in ed:
+    pub = (e.get("publisher") or "").lower()
+    loc = norm(e.get("location", ""))
+    if e.get("system_appx") or "microsoft windows" in pub:
         return True
-    if loc.startswith(DOSSIERS_SYSTEME):
+    if loc.startswith(SYSTEM_FOLDERS):
         return True
-    return any(f"\\{d}" in loc for d in WINDOWS_DOSSIERS)
+    return any(f"\\{d}" in loc for d in WINDOWS_FOLDERS)
 
 
 def windows_core_entries():
-    """Entrées pour les dossiers cœur de Windows (C:\\Windows, Defender, ...) qui n'ont aucun désinstalleur."""
+    """Entries for the core Windows folders (C:\\Windows, Defender, ...) which have no uninstaller."""
     cand = [os.environ.get("WINDIR", r"C:\Windows")]
     for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"):
         base = os.environ.get(k)
@@ -275,14 +276,14 @@ def windows_core_entries():
     for p in cand:
         if os.path.isdir(p) and norm(p) not in seen:
             seen.add(norm(p))
-            nom = "Windows (système d'exploitation)" if norm(p) == norm(cand[0]) else os.path.basename(p)
-            items.append({"nom": nom, "editeur": "Microsoft Corporation", "version": "", "emplacement": p,
-                          "taille_registre": 0, "source": "Système"})
+            name = "Windows (operating system)" if norm(p) == norm(cand[0]) else os.path.basename(p)
+            items.append({"name": name, "publisher": "Microsoft Corporation", "version": "", "location": p,
+                          "registry_size": 0, "source": "System"})
     return items
 
 
 def has_files(root, max_depth=2):
-    """True si `root` contient au moins un fichier (jusqu'à `max_depth` niveaux)."""
+    """True if `root` contains at least one file (up to `max_depth` levels)."""
     stack = [(root, 0)]
     while stack:
         d, lvl = stack.pop()
@@ -302,22 +303,22 @@ def has_files(root, max_depth=2):
 
 
 def human(n):
-    """Formate des octets en unité lisible (o, Ko, Mo, Go, To)."""
+    """Format bytes into a readable unit (B, KB, MB, GB, TB)."""
     n = float(n)
-    for u in ("o", "Ko", "Mo", "Go", "To"):
-        if n < 1024 or u == "To":
-            return f"{n:.0f} {u}" if u == "o" else f"{n:.2f} {u}"
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or u == "TB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.2f} {u}"
         n /= 1024
 
 
 def drives():
-    """Liste les lecteurs existants (C:\\, D:\\, ...)."""
+    """List the existing drives (C:\\, D:\\, ...)."""
     return [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
 
 
-# ------------------------------------------------------------------- sources
+# --------------------------------------------------------------------- sources
 def reg_values(key):
-    """Lit toutes les valeurs d'une clé de registre ouverte et les retourne sous forme de dict."""
+    """Read all values of an open registry key and return them as a dict."""
     out = {}
     i = 0
     while True:
@@ -330,10 +331,10 @@ def reg_values(key):
 
 
 def from_registry():
-    """Source 1 : clés Uninstall (ce que montre "Applications installées").
+    """Source 1: Uninstall keys (what "Installed apps" shows).
 
-    Chaque sous-clé = un logiciel. L'emplacement vient de InstallLocation, ou à
-    défaut est déduit de DisplayIcon / UninstallString (souvent renseignés).
+    Each subkey = one software. The location comes from InstallLocation, or
+    otherwise is deduced from DisplayIcon / UninstallString (often filled in).
     """
     items = []
     roots = [
@@ -342,7 +343,7 @@ def from_registry():
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_64KEY),
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", winreg.KEY_WOW64_32KEY),
     ]
-    # autres profils chargés (nécessite admin pour la plupart)
+    # other loaded profiles (mostly require admin)
     try:
         i = 0
         while True:
@@ -372,28 +373,118 @@ def from_registry():
             if not name or v.get("SystemComponent") == 1 and not v.get("InstallLocation"):
                 if not name:
                     continue
-            loc = clean_path(v.get("InstallLocation", ""))
-            if not loc or not os.path.isdir(loc):
-                for k in ("DisplayIcon", "UninstallString"):
-                    p = folder_of(clean_path(str(v.get(k, ""))))
-                    if p and not norm(p).startswith(DOSSIERS_SYSTEME) and "installer" not in norm(p):
-                        loc = p
-                        break
+            loc, declared = resolve_location(sub, v)
             items.append({
-                "nom": name, "editeur": v.get("Publisher", ""), "version": v.get("DisplayVersion", ""),
-                "emplacement": loc if loc and os.path.isdir(loc) else "",
-                "taille_registre": int(v.get("EstimatedSize", 0) or 0) * 1024
+                "name": name, "publisher": v.get("Publisher", ""), "version": v.get("DisplayVersion", ""),
+                "location": loc, "declared_location": declared,
+                "registry_size": int(v.get("EstimatedSize", 0) or 0) * 1024
                 if isinstance(v.get("EstimatedSize", 0), int) else 0,
                 "description": short(v.get("Comments", "")),
-                "source": "Registre",
+                "source": "Registry",
             })
     return items
 
 
+# Registry values that may reveal the install folder (in order of reliability)
+LOCATION_KEYS = ("InstallLocation", "InstallDir", "InstallPath", "Inno Setup: App Path", "Path",
+                 "DisplayIcon", "UninstallString", "QuietUninstallString", "ModifyPath")
+# Generic folders that do not designate the software's own folder
+GENERIC_FOLDERS = ("\\installer", "\\package cache", "\\common files", "\\temp", "\\downloaded installations")
+
+
+def msi_install_location(guid):
+    """Ask Windows Installer for the folder of an MSI product (uninstall key = {GUID})."""
+    if not (guid.startswith("{") and guid.endswith("}")):
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_uint(1024)
+        if ctypes.windll.msi.MsiGetProductInfoW(guid, "InstallLocation", buf, ctypes.byref(size)) == 0:
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+def resolve_location(sub, v):
+    """Look for the folder of a registry software.
+
+    Returns (existing_location, declared_but_missing_location).
+    All the values of LOCATION_KEYS are tried, then the MSI API. The first
+    folder that really exists wins; otherwise the first declared path is kept
+    so that we can say "declared here but files missing".
+    """
+    candidates = [msi_install_location(sub)] if sub.startswith("{") else []
+    candidates += [str(v.get(k, "")) for k in LOCATION_KEYS]
+    declared = ""
+    for raw in candidates:
+        p = clean_path(raw)
+        if not p:
+            continue
+        p = folder_of(p) if not os.path.isdir(p) else p
+        n = norm(p)
+        if n.startswith(SYSTEM_FOLDERS) or any(g in n + "\\" for g in GENERIC_FOLDERS):
+            continue
+        if os.path.isdir(p) and os.path.dirname(n) != os.path.splitdrive(n)[0]:
+            return p, ""
+        declared = declared or p
+    return "", declared
+
+
+# Folder names too common to identify a software (avoids false matches)
+GENERIC_WORDS = {"windows", "microsoft", "common", "shared", "commonfiles", "tools", "runtime", "update",
+                 "installer", "framework", "data", "microsoftsdks", "package", "packages", "programs",
+                 "windowsapps", "reference", "assemblies", "netframework"}
+
+
+def alnum(s):
+    """Lowercase letters and digits only (to compare software and folder names)."""
+    return "".join(c for c in str(s).lower() if c.isalnum())
+
+
+def guess_location(name, publisher, program_folders):
+    """Guess the folder of a software whose registry entry gives no location.
+
+    Looks, in Program Files/ProgramData/AppData..., for a folder (or Publisher\\Product)
+    whose name matches the software name. Returns "" if there is no clear candidate.
+    """
+    target = alnum(name)
+    pub = alnum(str(publisher).split(",")[0].replace("Inc.", "").replace("Corporation", ""))
+    if len(target) < 3:
+        return ""
+
+    # The product name must START with the folder name (with or without the publisher prefix)
+    targets = {target, alnum(" ".join(str(name).split()[1:]))} - {""}
+
+    def match(folder):
+        d = alnum(folder)
+        if len(d) < 6 or d in GENERIC_WORDS:
+            return False
+        return any(c == d or c.startswith(d) or (len(c) >= 5 and d.startswith(c)) for c in targets)
+
+    for root in program_folders:
+        try:
+            for e in os.scandir(root):
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                d = alnum(e.name)
+                # Publisher folder (Google, Microsoft, NVIDIA...): never kept as is because
+                # it is shared between products; only the product inside is searched.
+                if pub and len(d) >= 3 and (d in pub or pub in d):
+                    for s in os.scandir(e.path):
+                        if s.is_dir(follow_symlinks=False) and match(s.name):
+                            return s.path
+                elif match(e.name):
+                    return e.path
+        except OSError:
+            continue
+    return ""
+
+
 def from_appx():
-    """Source 2 : applications Store/MSIX, absentes des clés Uninstall (via PowerShell)."""
-    # SignatureKind=System / NonRemovable : paquets intégrés indispensables à Windows
-    # -AllUsers exige les droits admin ; sans eux, repli sur l'utilisateur courant.
+    """Source 2: Store/MSIX applications, absent from the Uninstall keys (via PowerShell)."""
+    # NonRemovable: packages that Windows refuses to uninstall (essential to the system)
+    # -AllUsers requires admin rights; without them, fall back to the current user.
     cmd = ("$p = try { Get-AppxPackage -AllUsers -ErrorAction Stop } catch { Get-AppxPackage }; "
            "$p | Where-Object {$_.InstallLocation} | "
            "Select-Object Name,Publisher,Version,InstallLocation,SignatureKind,NonRemovable | "
@@ -405,14 +496,14 @@ def from_appx():
         return []
     if isinstance(data, dict):
         data = [data]
-    return [{"nom": d["Name"], "editeur": d.get("Publisher", ""), "version": d.get("Version", ""),
-             "emplacement": d["InstallLocation"], "taille_registre": 0, "source": "Store/MSIX",
-             "systeme_appx": str(d.get("SignatureKind")) in ("System", "3") or bool(d.get("NonRemovable"))}
+    return [{"name": d["Name"], "publisher": d.get("Publisher", ""), "version": d.get("Version", ""),
+             "location": d["InstallLocation"], "registry_size": 0, "source": "Store/MSIX",
+             "system_appx": bool(d.get("NonRemovable"))}
             for d in data]
 
 
 def from_services():
-    """Source 3 : services dont l'exécutable est hors de Windows (révèle des logiciels sans désinstallateur)."""
+    """Source 3: services whose executable is outside Windows (reveals software without an uninstaller)."""
     items = []
     try:
         base = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services")
@@ -430,17 +521,17 @@ def from_services():
         except OSError:
             continue
         folder = folder_of(clean_path(str(v.get("ImagePath", ""))))
-        if folder and not norm(folder).startswith(DOSSIERS_SYSTEME) and os.path.isdir(folder) \
+        if folder and not norm(folder).startswith(SYSTEM_FOLDERS) and os.path.isdir(folder) \
                 and "driverstore" not in norm(folder):
-            items.append({"nom": v.get("DisplayName", sub) if not str(v.get("DisplayName", "")).startswith("@") else sub,
-                          "editeur": "", "version": "", "emplacement": folder, "taille_registre": 0,
+            items.append({"name": v.get("DisplayName", sub) if not str(v.get("DisplayName", "")).startswith("@") else sub,
+                          "publisher": "", "version": "", "location": folder, "registry_size": 0,
                           "description": short(v.get("Description", "")),
                           "source": "Service"})
     return items
 
 
 def from_app_paths():
-    """Source 4 : clés "App Paths", où les programmes déclarent leur .exe (commande Exécuter)."""
+    """Source 4: "App Paths" keys, where programs declare their .exe (Run command)."""
     items = []
     for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
         try:
@@ -459,14 +550,14 @@ def from_app_paths():
             except OSError:
                 continue
             folder = folder_of(clean_path(str(v.get("", ""))))
-            if folder and not norm(folder).startswith(DOSSIERS_SYSTEME):
-                items.append({"nom": os.path.splitext(sub)[0], "editeur": "", "version": "",
-                              "emplacement": folder, "taille_registre": 0, "source": "App Paths"})
+            if folder and not norm(folder).startswith(SYSTEM_FOLDERS):
+                items.append({"name": os.path.splitext(sub)[0], "publisher": "", "version": "",
+                              "location": folder, "registry_size": 0, "source": "App Paths"})
     return items
 
 
 def from_shortcuts():
-    """Source 5 : cibles des raccourcis du menu Démarrer (utilisateur + tous les utilisateurs)."""
+    """Source 5: targets of the Start menu shortcuts (current user + all users)."""
     ps = (
         "$s=New-Object -ComObject WScript.Shell;"
         "$d=@($env:ProgramData+'\\Microsoft\\Windows\\Start Menu\\Programs',$env:APPDATA+'\\Microsoft\\Windows\\Start Menu\\Programs');"
@@ -483,19 +574,19 @@ def from_shortcuts():
     items = []
     for d in data:
         folder = folder_of(d["T"])
-        if folder and os.path.isdir(folder) and not norm(folder).startswith(DOSSIERS_SYSTEME):
-            items.append({"nom": d["N"], "editeur": "", "version": "", "emplacement": folder,
-                          "taille_registre": 0, "source": "Raccourci"})
+        if folder and os.path.isdir(folder) and not norm(folder).startswith(SYSTEM_FOLDERS):
+            items.append({"name": d["N"], "publisher": "", "version": "", "location": folder,
+                          "registry_size": 0, "source": "Shortcut"})
     return items
 
 
-# ------------------------------------------------- détection non enregistrés
+# ------------------------------------------------- detection of unregistered software
 def candidate_roots(deep):
-    """Dossiers à explorer pour trouver des logiciels non déclarés.
+    """Folders to explore to find undeclared software.
 
-    Retourne des tuples (chemin, filtrer_appdata, chercher_residus). Le 2e booléen
-    ignore les sous-dossiers de cache (EXCLUS_APPDATA) ; le 3e active la détection
-    des dossiers sans exécutable (Program Files, ProgramData uniquement).
+    Returns tuples (path, filter_appdata, look_for_leftovers). The 2nd boolean
+    skips cache subfolders (APPDATA_EXCLUDES); the 3rd enables the detection
+    of folders without executables (Program Files, ProgramData only).
     """
     roots = []
     env = os.environ
@@ -516,11 +607,11 @@ def candidate_roots(deep):
     for d in drives():
         try:
             for e in os.scandir(d):
-                if e.is_dir(follow_symlinks=False) and e.name.lower() not in EXCLUS_RACINE:
+                if e.is_dir(follow_symlinks=False) and e.name.lower() not in ROOT_EXCLUDES:
                     roots.append((e.path, False, False))
         except OSError:
             pass
-    # Dédoublonnage + suppression des chemins inexistants
+    # De-duplication + removal of non-existent paths
     seen, out = set(), []
     for r, f, res in roots:
         n = norm(r)
@@ -531,15 +622,15 @@ def candidate_roots(deep):
 
 
 def find_unregistered(known, deep):
-    """Trouve les logiciels présents sur disque mais sans entrée de désinstallation.
+    """Find software present on disk but without an uninstall entry.
 
-    `known` : chemins déjà identifiés. Retourne {chemin: type} où type vaut :
-      - "exe"    : dossier contenant des exécutables (logiciel/portable/jeu sans désinstalleur) ;
-      - "residu" : dossier de Program Files/ProgramData/... avec des fichiers mais sans exécutable
-                   (reste d'un logiciel désinstallé, ou fichiers de logiciel dont le désinstalleur a disparu).
+    `known`: paths already identified. Returns {path: kind} where kind is:
+      - "exe"      : folder containing executables (software/portable/game without uninstaller);
+      - "leftover" : Program Files/ProgramData/... folder with files but no executable
+                     (remains of an uninstalled software, or software files whose uninstaller is gone).
 
-    Un dossier "éditeur" qui contient des logiciels connus (ex: Adobe\\Reader) n'est pas ignoré :
-    on inspecte ses autres sous-dossiers, qui peuvent être des logiciels orphelins.
+    A "publisher" folder that contains known software (e.g. Adobe\\Reader) is not skipped:
+    its other subfolders are inspected, as they may be orphan software.
     """
     known_n = [norm(k) for k in known if k]
 
@@ -557,56 +648,56 @@ def find_unregistered(known, deep):
 
     found = {}
 
-    def examine(path, residu, level, is_drive_root):
+    def examine(path, leftovers, level, is_drive_root):
         n = norm(path)
-        if n.startswith(DOSSIERS_SYSTEME) or inside_known(n):
+        if n.startswith(SYSTEM_FOLDERS) or inside_known(n):
             return
         if contains_known(n):
             for s in subdirs(path):
-                examine(s, residu, level + 1, False)
+                examine(s, leftovers, level + 1, False)
             return
         if has_exe(path, 4):
             found[path] = "exe"
         elif level == 0 and (is_drive_root or deep):
-            # conteneur type "D:\Jeux" : un niveau plus bas
+            # container such as "D:\Games": one level deeper
             for s in subdirs(path):
-                examine(s, residu, level + 1, False)
-        elif residu and level == 0 and os.path.basename(n) not in EXCLUS_RESIDU and has_files(path):
-            found[path] = "residu"
+                examine(s, leftovers, level + 1, False)
+        elif leftovers and level == 0 and os.path.basename(n) not in LEFTOVER_EXCLUDES and has_files(path):
+            found[path] = "leftover"
 
     roots = candidate_roots(deep)
-    bar = Progress("Analyse des lecteurs", len(roots))
-    for root, filtre, residu in roots:
+    bar = Progress("Scanning drives", len(roots))
+    for root, filt, leftovers in roots:
         bar.step(root[-45:])
         drive_root = os.path.dirname(norm(root)) == os.path.splitdrive(norm(root))[0]
         for s in subdirs(root):
-            if filtre and os.path.basename(norm(s)) in EXCLUS_APPDATA:
+            if filt and os.path.basename(norm(s)) in APPDATA_EXCLUDES:
                 continue
-            examine(s, residu, 0, drive_root)
+            examine(s, leftovers, 0, drive_root)
     bar.close()
     return dict(sorted(found.items(), key=lambda kv: kv[0].lower()))
 
 
-# ----------------------------------------------------------------------- main
+# ------------------------------------------------------------------------ main
 def main():
-    """Point d'entrée : collecte, fusion, détection, calcul des tailles, affichage et export."""
+    """Entry point: collection, merge, detection, size computation, display and export."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default="inventaire_logiciels.csv")
-    ap.add_argument("--json", default="inventaire_logiciels.json")
-    ap.add_argument("--deep", action="store_true", help="descend un niveau supplémentaire dans les conteneurs")
-    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--csv", default="software_inventory.csv", help="CSV output file")
+    ap.add_argument("--json", default="software_inventory.json", help="JSON output file")
+    ap.add_argument("--deep", action="store_true", help="go one extra level deeper in container folders")
+    # Size computation is I/O bound, so threads speed it up a lot
+    ap.add_argument("--workers", type=int, default=8, help="threads used to compute sizes")
     a = ap.parse_args()
 
     if os.name != "nt":
-        sys.exit("Ce script ne fonctionne que sous Windows.")
+        sys.exit("This script only works on Windows.")
     try:
-        import ctypes
         if not ctypes.windll.shell32.IsUserAnAdmin():
-            print("[!] Non administrateur : certains dossiers/profils seront inaccessibles.\n")
+            print("[!] Not running as administrator: some folders/profiles will be inaccessible.\n")
     except Exception:
         pass
 
-    print("Collecte des sources (registre, Store, services, raccourcis, système)...")
+    print("Collecting sources (registry, Store, services, shortcuts, system)...")
     items = []
     fns = (from_registry, from_appx, from_services, from_app_paths, from_shortcuts, windows_core_entries)
     bar = Progress("Sources", len(fns))
@@ -614,85 +705,114 @@ def main():
         bar.step(f"{fn.__name__}...", inc=0)
         r = fn()
         items += r
-        bar.step(f"{fn.__name__}: {len(r)} entrées")
+        bar.step(f"{fn.__name__}: {len(r)} entries")
     bar.close()
 
-    # fusion par emplacement : on garde le meilleur nom, on cumule les sources
+    # merge by location: keep the best name, accumulate the sources
     merged = {}
-    sans_loc = []
+    no_loc = []
     for it in items:
-        if it["emplacement"]:
-            k = norm(it["emplacement"])
+        if it["location"]:
+            k = norm(it["location"])
             m = merged.get(k)
             if not m:
                 merged[k] = dict(it, sources={it["source"]})
             else:
                 m["sources"].add(it["source"])
-                if it["source"] == "Registre" and m["source"] != "Registre":
-                    for f in ("nom", "editeur", "version"):
+                if it["source"] == "Registry" and m["source"] != "Registry":
+                    for f in ("name", "publisher", "version"):
                         m[f] = it[f] or m[f]
-                    m["source"] = "Registre"
-                m["taille_registre"] = m["taille_registre"] or it["taille_registre"]
-                m["systeme_appx"] = m.get("systeme_appx") or it.get("systeme_appx", False)
+                    m["source"] = "Registry"
+                m["registry_size"] = m["registry_size"] or it["registry_size"]
+                m["system_appx"] = m.get("system_appx") or it.get("system_appx", False)
                 m["description"] = m.get("description") or it.get("description", "")
-        elif it["source"] == "Registre":
-            sans_loc.append(dict(it, sources={"Registre"}))
+        elif it["source"] == "Registry":
+            no_loc.append(dict(it, sources={"Registry"}))
 
-    print("Recherche des logiciels sans désinstalleur (analyse des lecteurs)...")
+    # Software identified but whose folder was not found: try to deduce it from the name
+    program_dirs = [r for r, _, res in candidate_roots(False) if res]
+    for e in no_loc:
+        g = guess_location(e["name"], e["publisher"], program_dirs)
+        if g:
+            e["location"], e["deduced"] = g, True
+    deduced = [e for e in no_loc if e["location"]]
+    no_loc = [e for e in no_loc if not e["location"]]
+    for e in deduced:
+        k = norm(e["location"])
+        if k in merged:
+            merged[k]["sources"].add("Registry")
+        else:
+            merged[k] = e
+
+    print("Looking for software without an uninstaller (scanning drives)...")
     known = list(merged.keys())
-    libelles = {"exe": "Non enregistré (sans désinstalleur)", "residu": "Résidu sans exécutable"}
+    labels = {"exe": "Unregistered (no uninstaller)", "leftover": "Leftover without executable"}
     for p, kind in find_unregistered(known, a.deep).items():
-        merged[norm(p)] = {"nom": os.path.basename(p), "editeur": "", "version": "", "emplacement": p,
-                           "taille_registre": 0, "source": libelles[kind], "sources": {libelles[kind]}}
+        merged[norm(p)] = {"name": os.path.basename(p), "publisher": "", "version": "", "location": p,
+                           "registry_size": 0, "source": labels[kind], "sources": {labels[kind]}}
 
-    entries = list(merged.values()) + sans_loc
-    bar = Progress("Calcul des tailles", len(entries))
+    entries = list(merged.values()) + no_loc
+    bar = Progress("Computing sizes", len(entries))
 
     def work(e):
-        if e["emplacement"]:
-            e["taille"], e["fichiers"] = dir_size(e["emplacement"])
-            e["taille_approx"] = False
+        """Compute size, status, drive, description and Windows flag of one entry (runs in a thread)."""
+        if e["location"]:
+            e["size"], e["files"] = dir_size(e["location"])
+            e["approx_size"] = False
+            if e["files"] == 0:
+                e["status"] = "Empty folder or access denied"
+            else:
+                e["status"] = "Location deduced from name" if e.get("deduced") else "OK"
         else:
-            e["taille"], e["fichiers"], e["taille_approx"] = e["taille_registre"], 0, True
-        e["lecteur"] = os.path.splitdrive(e["emplacement"])[0].upper() + "\\" if e["emplacement"] else "?"
+            e["size"], e["files"], e["approx_size"] = e["registry_size"], 0, True
+            e["status"] = ("Files not found (declared folder missing)" if e.get("declared_location")
+                           else "Files not found (unknown location)")
+            e["location"] = ""
+        e["drive"] = os.path.splitdrive(e["location"])[0].upper() + "\\" if e["location"] else "?"
         e["source"] = ", ".join(sorted(e["sources"]))
-        # Description : celle déclarée si elle existe, sinon métadonnées de l'.exe
-        if not e.get("description") and e["emplacement"]:
-            e["description"] = short(exe_description(e["emplacement"]))
+        # Description: the declared one if any, otherwise the .exe metadata
+        if not e.get("description") and e["location"]:
+            e["description"] = short(exe_description(e["location"]))
         e["description"] = e.get("description", "")
-        e["windows"] = "Oui" if is_windows(e) else "Non"
-        bar.step(f"{e['nom'][:30]} ({human(e['taille'])})")
+        e["windows"] = "Yes" if is_windows(e) else "No"
+        bar.step(f"{e['name'][:30]} ({human(e['size'])})")
         return e
 
     with ThreadPoolExecutor(a.workers) as ex:
         entries = list(ex.map(work, entries))
     bar.close()
 
-    entries.sort(key=lambda e: (e["lecteur"], -e["taille"]))
-    for lec in sorted({e["lecteur"] for e in entries}):
-        grp = [e for e in entries if e["lecteur"] == lec]
-        label = "Emplacement inconnu (taille registre)" if lec == "?" else f"Lecteur {lec}"
-        print(f"\n===== {label} — {len(grp)} logiciels — total {human(sum(e['taille'] for e in grp))} =====")
+    # Display: by drive, biggest first; the "?" group (no location) comes last
+    entries.sort(key=lambda e: (e["drive"], -e["size"]))
+    for drv in sorted({e["drive"] for e in entries}):
+        grp = [e for e in entries if e["drive"] == drv]
+        label = "Files not found (size = registry value)" if drv == "?" else f"Drive {drv}"
+        print(f"\n===== {label} — {len(grp)} software — total {human(sum(e['size'] for e in grp))} =====")
         for e in grp:
-            tag = "~" if e["taille_approx"] else " "
-            win = "[WIN] " if e["windows"] == "Oui" else ""
-            print(f"{tag}{human(e['taille']):>10}  {win}{e['nom'][:45]:<45} [{e['source']}]  {e['emplacement'] or '-'}")
+            tag = "~" if e["approx_size"] else " "
+            win = "[WIN] " if e["windows"] == "Yes" else ""
+            place = e["location"] or (f"(declared: {e['declared_location']})" if e.get("declared_location") else "-")
+            print(f"{tag}{human(e['size']):>10}  {win}{e['name'][:45]:<45} [{e['source']}]  {place}")
+            if e["status"] != "OK":
+                print(f"{'':>13}! {e['status']}")
             if e["description"]:
                 print(f"{'':>13}-> {e['description']}")
 
-    nb_win = sum(e["windows"] == "Oui" for e in entries)
-    print(f"\n{nb_win} composant(s) nécessaire(s) au fonctionnement de Windows sur {len(entries)} (marqués [WIN]).")
+    nb_win = sum(e["windows"] == "Yes" for e in entries)
+    print(f"\n{nb_win} component(s) required for Windows to work out of {len(entries)} (marked [WIN]).")
 
-    # Exports : utf-8-sig pour que Excel lise correctement les accents
-    cols = ["lecteur", "nom", "description", "windows", "editeur", "version", "taille", "fichiers",
-            "taille_approx", "source", "emplacement"]
+    # Exports: utf-8-sig so that Excel reads accents correctly
+    cols = ["drive", "name", "description", "windows", "status", "publisher", "version", "size", "files",
+            "approx_size", "source", "location", "declared_location"]
+    for e in entries:
+        e.setdefault("declared_location", "")
     with open(a.csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore", delimiter=";")
         w.writeheader()
         w.writerows(entries)
     with open(a.json, "w", encoding="utf-8") as f:
         json.dump([{c: e[c] for c in cols} for e in entries], f, ensure_ascii=False, indent=2)
-    print(f"\nExporté : {a.csv} et {a.json}  (~ = taille estimée par le registre, emplacement inconnu)")
+    print(f"\nExported: {a.csv} and {a.json}  (~ = size estimated from the registry, unknown location)")
 
 
 if __name__ == "__main__":
